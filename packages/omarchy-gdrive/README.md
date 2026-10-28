@@ -260,31 +260,17 @@ makepkg --printsrcinfo > .SRCINFO
 makepkg -f
 ```
 
-The `PKGBUILD` builds from the files in this repository, which is private, and
-the built package is published as a release artifact there. Do not commit
-`dist/`, `pkg/`, `repo/`, or `src/`.
-
-### Private pacman repository
-
-`./make-repo.sh` builds the package and refreshes a pacman repository under
-`repo/x86_64` with `repo-add`; `--sign` / `--key KEY` sign the database. Serve
-that directory over HTTPS, or plain HTTP on a trusted network such as
-Tailscale, and add it to `/etc/pacman.conf`:
+The `PKGBUILD` builds from the files in this directory. This repository also
+holds the published pacman repository: the `pages` workflow builds every package
+inside an `archlinux:base-devel` container and deploys it to GitHub Pages.
 
 ```ini
-[omarchy-gdrive]
+[omarchy-pkgs]
 SigLevel = Optional TrustAll
-Server = https://<host>/x86_64
+Server = https://skystone-studio.github.io/omarchy-pkgs/x86_64
 ```
 
-Then `sudo pacman -Syu omarchy-gdrive`. Use
-`SigLevel = Optional DatabaseRequired` when the database is signed.
-
-A public copy can be published with GitHub Pages: the `pages` workflow builds the
-package in an `archlinux:base-devel` container and uploads `repo/`. Pages sites
-are public on Free and Pro plans, so use it only when the package can be
-world-readable. The resulting server line is
-`https://sss-marcelo.github.io/omarchy-gdrive/x86_64`.
+Do not commit `dist/`, `pkg/`, `repo/`, or `src/`.
 
 ## License
 

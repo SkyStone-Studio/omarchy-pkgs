@@ -17,7 +17,7 @@ source=('omarchy-gdrive-setup'
 sha256sums=('05d563751aace8fdd7cd5f7870a6be45878eee7a72e4a9024be0b2822994f346'
             '65b4d58450fbc57e3ccb6a40ed20ac0321b8ee923b5fea21f66a12f5f1c73fc6'
             '5cca605113b3aacc7aec55e72deddb368fd0711486cb4a5375964ad1a675210a'
-            'f124cf749982ad16ff574d8ffd7f0186a522a758f1f48265945508fb3bc57978'
+            '1a677c1332099ee1b2a45e47e1699ac40cf42d5d58d4ebfce89c8fd8858fd402'
             'd6646ba1fcc87c4e1d9213fa8e420e67b7188b1f7bd120af54d016f6e18f0e1f')
 
 package() {
