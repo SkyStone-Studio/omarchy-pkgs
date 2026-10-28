@@ -1,0 +1,30 @@
+# Maintainer: SSS-Marcelo
+pkgname=omarchy-agent-usage-omp
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='omp (Oh My Pi) usage collector for the omarchy agents bar widget'
+arch=('any')
+url='https://github.com/SkyStone-Studio/omarchy-pkgs'
+license=('MIT')
+depends=('python' 'omarchy')
+makedepends=()
+install=omarchy-agent-usage-omp.install
+source=('omarchy-agent-usage-omp'
+        'README.md'
+        'LICENSE')
+sha256sums=('7e4a815fddacc003458e55af4dbbc4d283657b2f763223c5fccfca49ff7152c2'
+            'ea27993b7c5df8af31df31745ac64a1d27b82553e93b80d197402b3f3db3820c'
+            '26e0d1929275b46d985c28ec5b4885f4e6fc207d0ad9277773d58c4c13df3bba')
+
+package() {
+  install -Dm755 "$srcdir/omarchy-agent-usage-omp" "$pkgdir/usr/bin/omarchy-agent-usage-omp"
+
+  # omarchy-agent-usage-update discovers collectors by globbing this directory
+  # for omarchy-agent-usage-*; the shipped collectors are symlinks to /usr/bin.
+  install -d "$pkgdir/usr/share/omarchy/bin"
+  ln -s /usr/bin/omarchy-agent-usage-omp \
+    "$pkgdir/usr/share/omarchy/bin/omarchy-agent-usage-omp"
+
+  install -Dm644 "$srcdir/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

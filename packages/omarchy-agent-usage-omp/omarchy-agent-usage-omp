@@ -1,0 +1,447 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the omp (Oh My Pi) usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect omp (Oh My Pi) usage into one display-ready JSON record.
+
+omp is a multi-provider harness: a single session can route through any
+model the user has credentials for, so the collector aggregates every
+assistant message across providers and surfaces one record whose
+`modelUsage` names whatever models were driven that day. Local stats come
+from native omp session files at ~/.omp/agent/sessions/**.jsonl; if omp's
+own `client_usage` table in ~/.omp/agent/agent.db is populated, that is the
+preferred source (already aggregated per local day). omp has no
+subscription of its own — rate limits live with the upstream provider — so
+the record carries an empty limits array and a generic "Subscription"
+hero. The agents panel only ever reads the JSON this prints.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+AGENT_ID = "omp"
+AGENT_NAME = "Oh My Pi"
+
+# A scan this recent is only reused to dedup concurrent collector runs (the
+# update command backgrounds one per agent while the panel refreshes on its
+# own); every periodic widget refresh lands a real rescan, however low
+# refreshIntervalSec is set. --limits-only promises only fresh limits, so it
+# may reuse a scan for up to 15 minutes. omp has no limits of its own, but
+# the flag still has to be honored so every collector accepts the same
+# invocation.
+SCAN_REUSE_SECONDS = 20
+LIMITS_ONLY_REUSE_SECONDS = 900
+
+
+def config_dir() -> Path:
+  """Resolve the omp config / data root.
+
+  Honors --session-dir (omp's native override), then OMP_SESSION_DIR /
+  PI_SESSION_DIR env vars, then ~/.omp. The collector does not need the
+  settings file itself; it only needs to know where the sessions live so
+  the same command works whether or not the user has overridden the root.
+  """
+  return Path(os.environ.get("OMP_SESSION_DIR") or os.environ.get("PI_SESSION_DIR") or "~/.omp").expanduser()
+
+
+def today_local() -> str:
+  return dt.datetime.now().strftime("%Y-%m-%d")
+
+
+def recent_dates() -> list[str]:
+  today = dt.datetime.now().date()
+  return [(today - dt.timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+
+
+def cache_root() -> Path:
+  root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy" / "agent-usage"
+  root.mkdir(parents=True, exist_ok=True)
+  return root
+
+
+def number(value) -> int:
+  try:
+    return max(0, round(float(value or 0)))
+  except Exception:
+    return 0
+
+
+def empty_bucket() -> dict[str, int]:
+  return {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cacheReadInputTokens": 0,
+    "cacheCreationInputTokens": 0,
+  }
+
+
+def empty_stats() -> dict:
+  return {
+    "todayPrompts": 0,
+    "todayTotalTokens": 0,
+    "todayTokensByModel": {},
+    "recentDays": {day: 0 for day in recent_dates()},
+    "totalPrompts": 0,
+    "activeDates": set(),
+    "modelUsage": {},
+    "_todaySessions": set(),
+    "_totalSessions": set(),
+  }
+
+
+def model_key(provider: str, model: str) -> str:
+  """Pick the panel's model row key.
+
+  omp's model strings arrive as `<provider>/<model>` (e.g.
+  `openrouter/minimax/minimax-m3`) or as a bare id. The panel keys models
+  by what shows in the "Tokens by model" rows, which expects the bare id
+  after a trailing-slash split; provider is a side dimension the panel
+  already separates elsewhere.
+  """
+  raw = str(model or "").strip()
+  if raw == "":
+    raw = str(provider or "unknown")
+  return raw.rstrip("/").split("/")[-1] or "unknown"
+
+
+def session_day(entry_ts: str, message_ts) -> str:
+  """Local-day bucket for an assistant message.
+
+  Prefer the message's own millisecond timestamp — the top-level ISO
+  timestamp is the entry's wall-clock time and matches the same instant in
+  practice, but the message ts is what every other collector keys off and
+  keeps day boundaries consistent across providers.
+  """
+  try:
+    if isinstance(message_ts, (int, float)) and message_ts > 0:
+      seconds = float(message_ts) / 1000.0 if message_ts > 10_000_000_000 else float(message_ts)
+      return dt.datetime.fromtimestamp(seconds).strftime("%Y-%m-%d")
+  except Exception:
+    pass
+  raw = str(entry_ts or "").strip()
+  if raw:
+    try:
+      parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+      if parsed.tzinfo is not None:
+        parsed = parsed.astimezone()
+      return parsed.strftime("%Y-%m-%d")
+    except Exception:
+      pass
+  return today_local()
+
+
+def add_to_bucket(bucket: dict[str, int], key: str, value) -> None:
+  bucket[key] = number(bucket.get(key)) + number(value)
+
+
+def add_message(stats: dict, day: str, model: str, input_tokens: int, output_tokens: int, cache_read: int, cache_write: int, session_key: str) -> None:
+  total = input_tokens + output_tokens + cache_read + cache_write
+  stats["totalPrompts"] += 1
+  stats["activeDates"].add(day)
+  stats["_totalSessions"].add(session_key)
+
+  bucket = stats["modelUsage"].setdefault(model, empty_bucket())
+  add_to_bucket(bucket, "inputTokens", input_tokens)
+  add_to_bucket(bucket, "outputTokens", output_tokens)
+  add_to_bucket(bucket, "cacheReadInputTokens", cache_read)
+  add_to_bucket(bucket, "cacheCreationInputTokens", cache_write)
+
+  # Older days fall outside the panel's recent window; we still count the
+  # spend in activeDates so the all-time "N days" stays accurate.
+  stats["recentDays"][day] = stats["recentDays"].get(day, 0) + total
+
+  if day == today_local():
+    stats["todayPrompts"] += 1
+    stats["todayTotalTokens"] += total
+    stats["todayTokensByModel"][model] = number(stats["todayTokensByModel"].get(model)) + total
+    stats["_todaySessions"].add(session_key)
+
+
+def scan_sessions(root: Path) -> dict:
+  """Walk every .jsonl under the omp sessions tree and aggregate usage.
+
+  Sessions are split by cwd hash on disk (e.g. `-Work/`, `-tmp/`); we treat
+  each file as one conversation. A session file with no assistant message
+  contributes nothing — empty / aborted runs don't paint the panel.
+  """
+  stats = empty_stats()
+  if not root.is_dir():
+    return stats
+
+  for path in sorted(root.rglob("*.jsonl")):
+    try:
+      with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+          line = line.strip()
+          if not line.startswith('{"type":"message"'):
+            continue
+          try:
+            entry = json.loads(line)
+          except Exception:
+            continue
+          message = entry.get("message") if isinstance(entry.get("message"), dict) else None
+          if not message or message.get("role") != "assistant":
+            continue
+          usage = message.get("usage")
+          if not isinstance(usage, dict):
+            continue
+          input_tokens = number(usage.get("input"))
+          output_tokens = number(usage.get("output"))
+          cache_read = number(usage.get("cacheRead"))
+          cache_write = number(usage.get("cacheWrite"))
+          if input_tokens + output_tokens + cache_read + cache_write <= 0:
+            continue
+          day = session_day(entry.get("timestamp"), message.get("timestamp"))
+          model = model_key(message.get("provider"), message.get("model"))
+          add_message(stats, day, model, input_tokens, output_tokens, cache_read, cache_write, str(path))
+    except OSError as exc:
+      print(f"omarchy-agent-usage-omp: ignoring unreadable session file {path}: {exc}", file=sys.stderr)
+
+  return stats
+
+
+def read_client_usage(db_path: Path) -> dict | None:
+  """Pull pre-aggregated day buckets from omp's own client_usage table.
+
+  omp maintains this table itself; when populated, it is cheaper and more
+  authoritative than re-parsing session files. An empty or missing table
+  is a normal state — the collector treats it as "no data here" and
+  returns None so the caller falls back to the session scan.
+  """
+  if not db_path.is_file():
+    return None
+  try:
+    conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+  except sqlite3.Error:
+    return None
+  try:
+    conn.execute("PRAGMA query_only = ON")
+    # recorded_at is local-day midnight in UNIX seconds (omp's billing
+    # bucket convention); grouping by that day matches the panel's recentDays
+    # window exactly. cost_usd is unused — the panel does not display cost.
+    rows = list(conn.execute(
+      "SELECT recorded_at, model, SUM(requests), SUM(input_tokens),"
+      " SUM(output_tokens), SUM(cache_read_tokens), SUM(cache_write_tokens)"
+      " FROM client_usage GROUP BY recorded_at, model"
+    ))
+  except sqlite3.Error:
+    return None
+  finally:
+    conn.close()
+  if not rows:
+    return None
+
+  stats = empty_stats()
+  for recorded_at, model, requests, input_tokens, output_tokens, cache_read, cache_write in rows:
+    try:
+      day = dt.datetime.fromtimestamp(int(recorded_at)).strftime("%Y-%m-%d")
+    except Exception:
+      continue
+    # add_message counts one prompt per call; the DB row's request count
+    # covers many, so add the remainder after.
+    add_message(
+      stats,
+      day,
+      model_key("", model),
+      number(input_tokens),
+      number(output_tokens),
+      number(cache_read),
+      number(cache_write),
+      # The DB has no session key, so use a synthetic bucket per day — the
+      # JSONL scan upgrades these to real session counts when both sources
+      # contribute.
+      f"client_usage:{recorded_at}",
+    )
+    extra = number(requests) - 1
+    if extra > 0:
+      stats["totalPrompts"] += extra
+  return stats
+
+
+def merge_stats(base: dict, extra: dict) -> dict:
+  """Combine two stats dicts without double-counting.
+
+  activeDates union (not sum) — a session that ran on Monday under omp and
+  was also recorded in client_usage on Monday is one active day, not two.
+  Token totals and per-model buckets sum (each row represents real spend).
+  Session sets union. The recentDays window only contains the latest week,
+  so older days fall outside it; the all-time count still includes them.
+  """
+  merged = empty_stats()
+  for source in (base, extra):
+    merged["todayPrompts"] += number(source.get("todayPrompts"))
+    merged["todayTotalTokens"] += number(source.get("todayTotalTokens"))
+    merged["totalPrompts"] += number(source.get("totalPrompts"))
+    merged["_todaySessions"].update(source.get("_todaySessions") or set())
+    merged["_totalSessions"].update(source.get("_totalSessions") or set())
+
+    combined_today = dict(merged["todayTokensByModel"])
+    for model, count in (source.get("todayTokensByModel") or {}).items():
+      combined_today[model] = number(combined_today.get(model)) + number(count)
+    merged["todayTokensByModel"] = combined_today
+
+    usage = {model: dict(bucket) for model, bucket in merged["modelUsage"].items()}
+    for model, bucket in (source.get("modelUsage") or {}).items():
+      target = usage.setdefault(model, empty_bucket())
+      for field, count in (bucket or {}).items():
+        add_to_bucket(target, field, count)
+    merged["modelUsage"] = usage
+
+    by_date = dict(merged["recentDays"])
+    for day, count in (source.get("recentDays") or {}).items():
+      by_date[day] = by_date.get(day, 0) + number(count)
+    merged["recentDays"] = by_date
+
+    merged["activeDates"].update(source.get("activeDates") or set())
+
+  return merged
+
+
+def finalize(stats: dict) -> dict:
+  """Shape the panel's record from the raw stats dict.
+
+  Sets collected during scanning become the integer counts the panel
+  reads; the JSON-serializable form is the only thing this function
+  returns, so the cache write below is safe to call with its result.
+  """
+  today = today_local()
+  recent_map = dict(stats.get("recentDays") or {})
+  recent = [{"date": day, "messageCount": number(recent_map.get(day, 0))} for day in recent_dates()]
+  # The recent map may also carry older days from scans that started before
+  # the window rolled forward. Append them so the all-time union stays
+  # intact even when recent_dates() only covers a week.
+  seen = set(day["date"] for day in recent)
+  for date, count in recent_map.items():
+    if date in seen or not date:
+      continue
+    seen.add(date)
+    recent.append({"date": date, "messageCount": number(count)})
+  recent.sort(key=lambda d: d["date"])
+
+  active_dates = sorted(stats.get("activeDates") or set())
+  return {
+    "todayPrompts": number(stats.get("todayPrompts")),
+    "todaySessions": len(stats.get("_todaySessions") or set()),
+    "todayTotalTokens": number(stats.get("todayTotalTokens")),
+    "todayTokensByModel": dict(stats.get("todayTokensByModel") or {}),
+    "recentDays": recent,
+    "totalPrompts": number(stats.get("totalPrompts")),
+    "totalSessions": len(stats.get("_totalSessions") or set()),
+    "activeDays": len(active_dates),
+    "activeDates": active_dates,
+    "modelUsage": dict(stats.get("modelUsage") or {}),
+  }
+
+
+def read_fresh_json(path: Path, max_age_seconds: float):
+  if max_age_seconds <= 0 or not path.exists():
+    return None
+  try:
+    age = time.time() - path.stat().st_mtime
+    if 0 <= age <= max_age_seconds:
+      return json.loads(path.read_text(encoding="utf-8"))
+  except Exception:
+    return None
+  return None
+
+
+def write_json(path: Path, payload: dict) -> None:
+  # A temp name unique to this writer, not derived from the target: several
+  # collectors can run at once (the update command backgrounds one per
+  # agent, the panel refreshes on its own), and a shared temp path means the
+  # second replace finds the first one's file already moved away.
+  handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+  tmp = Path(tmp_name)
+  try:
+    with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+      handle.write(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
+    tmp.chmod(0o644)
+    tmp.replace(path)
+  except BaseException:
+    tmp.unlink(missing_ok=True)
+    raise
+
+
+def cache_paths(omp_root: Path):
+  digest = hashlib.sha1(str(omp_root).encode("utf-8")).hexdigest()[:16]
+  root = cache_root()
+  return root / f"omp-scan-{digest}.json", root / f"omp-scan-{digest}.lock"
+
+
+def collect(omp_root: Path, max_age_seconds: float) -> dict:
+  """Return the panel-shaped stats dict, preferring the cache.
+
+  The cache is a pure optimization: a corrupted or foreign-shaped file is
+  a miss (rescan + rewrite) instead of a crash, and any cache-layer
+  failure degrades to a direct scan with a warning on stderr.
+  """
+  cache_file, _lock = cache_paths(omp_root)
+  try:
+    cached = read_fresh_json(cache_file, max_age_seconds)
+    if isinstance(cached, dict) and cached.get("scanDate") == today_local() and cached.get("schemaVersion") == 1:
+      stats = cached.get("stats")
+      if isinstance(stats, dict):
+        return stats
+  except Exception as exc:
+    print(f"omarchy-agent-usage-omp: cache unavailable ({exc}); scanning directly", file=sys.stderr)
+
+  stats = scan_sessions(omp_root / "agent" / "sessions")
+  client = read_client_usage(omp_root / "agent" / "agent.db")
+  if client is not None:
+    stats = merge_stats(stats, client)
+  finalized = finalize(stats)
+
+  try:
+    write_json(cache_file, {"schemaVersion": 1, "scanDate": today_local(), "stats": finalized})
+  except Exception as exc:
+    print(f"omarchy-agent-usage-omp: could not write usage cache ({exc})", file=sys.stderr)
+  return finalized
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description="Print the omp usage record as JSON")
+  # --force rescans everything and rewrites the cache. --limits-only reuses
+  # any recent scan because there are no limits to refresh; the flag still
+  # has to be honored so every collector accepts the same invocation.
+  parser.add_argument("--force", action="store_true")
+  parser.add_argument("--limits-only", action="store_true")
+  parser.add_argument("--session-dir", default=os.environ.get("OMP_SESSION_DIR") or os.environ.get("PI_SESSION_DIR"))
+  args = parser.parse_args()
+
+  omp_root = Path(args.session_dir).expanduser() if args.session_dir else config_dir()
+  max_age = 0 if args.force else (LIMITS_ONLY_REUSE_SECONDS if args.limits_only else SCAN_REUSE_SECONDS)
+
+  stats = collect(omp_root, max_age)
+
+  record = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    # omp has no subscription of its own: the hero reads tierLabel and falls
+    # back to "Subscription" when blank, which is the right shape for an
+    # aggregator that drives whatever model the user points it at.
+    "ready": number(stats["totalPrompts"]) > 0,
+    "hasLocalStats": True,
+    "tierLabel": "",
+    "usageStatusText": "",
+    "authHelpText": "",
+    "limits": [],
+  }
+  record.update(stats)
+  print(json.dumps(record, separators=(",", ":"), sort_keys=True))
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

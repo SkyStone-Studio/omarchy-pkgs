@@ -29,6 +29,7 @@ HTTPS-only, so transport integrity is still enforced by TLS.
 | Package | Description |
 |---|---|
 | `omarchy-gdrive` | Google Drive accounts mounted under `~/GoogleDrive/<email>` and listed in Files |
+| `omarchy-agent-usage-omp` | omp (Oh My Pi) usage collector for the omarchy agents bar widget |
 
 Package sources live in `packages/<name>/` with a normal `PKGBUILD`.
 
