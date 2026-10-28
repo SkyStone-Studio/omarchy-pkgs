@@ -7,11 +7,13 @@ and starts at login.
 
 ## Features
 
-- Every account is mounted at `~/GoogleDrive/<email>` and appears in the Files
-  sidebar as `<email>`.
-- Every Google Shared drive the account can see is mounted at
-  `~/GoogleDrive/Shared drives/<email>/<drive>` with its own service and sidebar
-  entry.
+- Every account is mounted at `~/GoogleDrive/<email>` and every Google Shared
+  drive at `~/GoogleDrive/Shared drives/<email>/<drive>`, each with its own
+  systemd user service.
+- One **Google Drive** sidebar entry; accounts and shared drives are folders
+  inside it.
+- Right-click a mounted account or shared drive in Files to **Disconnect** or
+  **Connect** it.
 - **Add Google Drive Account…** in the Files background right-click menu
   authorizes one more account and creates its mount, service, and sidebar
   entry.
@@ -72,7 +74,7 @@ creates:
 - `~/GoogleDrive/<email>` - the mounted Drive
 - `~/.config/systemd/user/rclone-<remote>.service` - the mount service for that
   account
-- a `<email>` bookmark for `~/GoogleDrive/<email>` in
+- a **Google Drive** bookmark for `~/GoogleDrive` in
   `~/.config/gtk-3.0/bookmarks`
 - `~/.config/omarchy-gdrive/accounts.tsv` - the `email <TAB> remote` mapping
 - `~/.local/state/omarchy-gdrive/setup.log` - setup diagnostics
@@ -114,6 +116,23 @@ Listing shared drives costs one Drive API call per account per run. With
 rclone's shared OAuth client that call can take 15-30 s, which makes a setup run
 with several drives slower than the My Drive-only version; a user OAuth client
 makes it fast.
+
+## Connect and disconnect
+
+Files shows one **Google Drive** entry. Inside it, each account mount and each
+shared-drive mount is a folder; right-click one and choose **Disconnect Google
+Drive mount**, or **Connect Google Drive mount** when it is down. The same helper
+is available on the command line:
+
+```bash
+omarchy-gdrive-mount --status     ~/GoogleDrive/<email>
+omarchy-gdrive-mount --disconnect ~/GoogleDrive/<email>
+omarchy-gdrive-mount --connect    ~/GoogleDrive/<email>
+```
+
+Disconnecting stops the mount and disables its systemd unit, so it stays down
+across logins. `omarchy-gdrive-setup` re-enables and starts it again; that is the
+repair path, so a full setup run undoes a manual disconnect.
 
 ## Add an account
 
@@ -221,6 +240,9 @@ script.
 - **No "Add Google Drive Account…" item in Files**: `nautilus-python` must be
   installed and Files must be restarted (`nautilus --quit`). The item is hidden
   when `omarchy-gdrive-setup` is not on `PATH`.
+- **No Connect/Disconnect entry when right-clicking a drive folder**: the item
+  only appears for the mount point itself, single selection, and when
+  `omarchy-gdrive-mount` is on `PATH`. Restart Files after upgrading the package.
 - **Files shows "Loading..." or an empty folder after setup**: quit and reopen
   Files (`nautilus --quit`). Nautilus can cache the empty mount point from
   before the mount existed.
@@ -271,7 +293,7 @@ The package does not own per-user data, so it leaves these behind:
 - `~/.config/omarchy-gdrive/` (`accounts.tsv`, `setup.lock`)
 - `~/.config/rclone/rclone.conf` (remove only the `gdrive*` sections if you use
   other rclone remotes)
-- the `<email>` and `<drive> (<email>)` lines in `~/.config/gtk-3.0/bookmarks`
+- the **Google Drive** line in `~/.config/gtk-3.0/bookmarks`
 - `~/.local/state/omarchy-gdrive/`
 
 Delete them by hand after unmounting (`fusermount3 -uz ~/GoogleDrive/<email>`).
@@ -293,6 +315,7 @@ the account mount points.
 
 ```bash
 bash -n omarchy-gdrive-setup
+bash -n omarchy-gdrive-mount
 python3 -c 'compile(open("omarchy-gdrive-nautilus.py").read(), "x", "exec")'
 updpkgsums
 makepkg --printsrcinfo > .SRCINFO

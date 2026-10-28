@@ -775,28 +775,17 @@ setup_shared_drives() {
 
 # --- Files sidebar ----------------------------------------------------------
 
+# One sidebar entry for everything: the account and shared-drive mounts are
+# reachable inside ~/GoogleDrive, and each mount has a Files context menu.
 bookmark_sync() {
   local -a pairs=()
-  local email dir account name
+  local email
   while IFS= read -r email; do
-    [[ -n "$email" ]] || continue
-    mountpoint -q "$gdrive_root/$email" || continue
-    pairs+=("$gdrive_root/$email"$'\t'"$email")
+    if [[ -n "$email" ]]; then
+      pairs=("$gdrive_root"$'\t'"Google Drive")
+      break
+    fi
   done < <(state_emails)
-
-  for dir in "$gdrive_root/Shared drives"/*/*; do
-    [[ -d "$dir" ]] || continue
-    mountpoint -q "$dir" || continue
-    name="${dir##*/}"
-    account="${dir%/*}"
-    pairs+=("$dir"$'\t'"$name (${account##*/})")
-  done
-
-  for dir in "$gdrive_root/Shared with me"/*; do
-    [[ -d "$dir" ]] || continue
-    mountpoint -q "$dir" || continue
-    pairs+=("$dir"$'\t'"Shared with me (${dir##*/})")
-  done
 
   if ((${#pairs[@]})); then
     printf '%s\n' "${pairs[@]}" | python3 -c "$py_bookmarks" "$bookmarks" "$gdrive_root" "$HOME"

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Connect, disconnect, or report one Google Drive mount created by
+# omarchy-gdrive-setup. Used by the Files context menu.
+#
+#   omarchy-gdrive-mount --status PATH
+#   omarchy-gdrive-mount --disconnect PATH
+#   omarchy-gdrive-mount --connect PATH
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-gdrive-mount --status|--connect|--disconnect PATH
+
+PATH is the mount point of an account (~/GoogleDrive/<email>) or of a Google
+Shared drive (~/GoogleDrive/Shared drives/<email>/<drive>).
+EOF
+}
+
+[[ $# -eq 2 ]] || { usage >&2; exit 2; }
+mode=$1
+target=${2%/}
+
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+unit_dir="$config_home/systemd/user"
+
+unit=""
+mount=""
+for unit_file in "$unit_dir"/rclone-*.service; do
+  [[ -f "$unit_file" ]] || continue
+  candidate="$(sed -n 's/^ExecStart=.* mount "[^"]*" "\([^"]*\)".*/\1/p' "$unit_file" | head -1)"
+  if [[ -n "$candidate" && "$candidate" == "$target" ]]; then
+    unit="${unit_file##*/}"
+    mount="$candidate"
+    break
+  fi
+done
+
+is_mounted() { mountpoint -q "$mount" 2>/dev/null; }
+
+case "$mode" in
+  --status)
+    [[ -n "$unit" ]] || { printf 'unknown\n'; exit 1; }
+    if is_mounted; then printf 'connected\n'; else printf 'disconnected\n'; fi
+    ;;
+  --disconnect)
+    [[ -n "$unit" ]] || { printf 'error: no Google Drive mount at %s\n' "$target" >&2; exit 1; }
+    # disable keeps it down across logins; omarchy-gdrive-setup re-enables it.
+    systemctl --user disable --now "$unit" >/dev/null 2>&1 || true
+    systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+    if is_mounted; then
+      fusermount3 -uz "$mount" >/dev/null 2>&1 || true
+    fi
+    sleep 1
+    if is_mounted; then
+      printf 'error: %s is still mounted\n' "$mount" >&2
+      exit 1
+    fi
+    printf 'Disconnected %s\n' "$mount"
+    ;;
+  --connect)
+    [[ -n "$unit" ]] || { printf 'error: no Google Drive mount at %s\n' "$target" >&2; exit 1; }
+    systemctl --user enable "$unit" >/dev/null 2>&1 || true
+    systemctl --user start "$unit"
+    for _ in $(seq 1 30); do
+      if is_mounted; then
+        break
+      fi
+      sleep 1
+    done
+    if ! is_mounted; then
+      printf 'error: %s is not mounted\n' "$mount" >&2
+      exit 1
+    fi
+    printf 'Connected %s\n' "$mount"
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
