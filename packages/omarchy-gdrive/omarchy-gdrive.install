@@ -1,0 +1,51 @@
+post_install() {
+  cat <<'EOF'
+Google Drive for Omarchy Files is installed.
+
+Connect an account:
+  omarchy-gdrive-setup
+
+Add more accounts from Files: right-click an empty area and choose
+"Add Google Drive Account…" (needs nautilus-python).
+
+Each account is mounted at ~/GoogleDrive/<email> and listed in the Files
+sidebar under its email address.
+
+Files loads extensions at startup, so restart it once after installing:
+  nautilus --quit
+
+The first run opens a browser for Google authorization and creates the
+mount point, the bookmark, and a systemd user service per account.
+
+For reliable access, configure your own OAuth client:
+  https://rclone.org/drive/#making-your-own-client-id
+EOF
+}
+
+post_upgrade() {
+  cat <<'EOF'
+Google Drive for Omarchy Files was upgraded to account-named mounts.
+
+Run the setup once to migrate:
+  omarchy-gdrive-setup
+
+It stops the old service, unmounts ~/GoogleDrive, recreates the mount at
+~/GoogleDrive/<email>, and rewrites the bookmark and the systemd unit.
+Until you run it, the sidebar still points at the old ~/GoogleDrive entry.
+
+Restart Files to load the new "Add Google Drive Account…" menu item:
+  nautilus --quit
+EOF
+}
+
+pre_remove() {
+  cat <<'EOF'
+Per-user data is not removed automatically:
+  - ~/GoogleDrive/<email>            (one folder per account)
+  - ~/.config/omarchy-gdrive/accounts.tsv
+  - ~/.config/rclone/rclone.conf
+  - ~/.config/systemd/user/rclone-*.service
+  - the account email bookmarks in ~/.config/gtk-3.0/bookmarks
+See /usr/share/doc/omarchy-gdrive/README.md for cleanup steps.
+EOF
+}

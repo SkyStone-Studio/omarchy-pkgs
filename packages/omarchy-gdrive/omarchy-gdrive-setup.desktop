@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Google Drive Setup
+Comment=Connect or repair Google Drive accounts in Files
+Exec=omarchy-launch-terminal omarchy-gdrive-setup
+Icon=folder-remote
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=Google;Drive;rclone;Files;
+StartupNotify=true

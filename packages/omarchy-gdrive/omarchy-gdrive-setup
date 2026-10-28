@@ -1,0 +1,791 @@
+#!/usr/bin/env bash
+# Installed as /usr/bin/omarchy-gdrive-setup by the omarchy-gdrive package.
+# Mount every Google Drive account with rclone at ~/GoogleDrive/<email> and list
+# it in the Files sidebar under its email address.
+#
+#   omarchy-gdrive-setup                     set up or repair all configured accounts
+#   omarchy-gdrive-setup --add-account       authorize a new account and add it
+#   omarchy-gdrive-setup --reauth [ACCOUNT]  reauthorize an account (email or remote)
+#   omarchy-gdrive-setup --help
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  omarchy-gdrive-setup                     set up or repair every configured account
+  omarchy-gdrive-setup --add-account       authorize a new account and add it
+  omarchy-gdrive-setup --reauth [ACCOUNT]  reauthorize an account, by email or rclone remote
+  omarchy-gdrive-setup --help
+
+Each account is mounted at ~/GoogleDrive/<email> and appears in the Files
+sidebar under its email address. Accounts are recorded in
+~/.config/omarchy-gdrive/accounts.tsv, one "<email>\t<rclone-remote>" line each.
+
+Modes:
+  (default)      Refresh every configured account: recreate mount points and
+                 systemd user services, migrate a 0.1.0 single ~/GoogleDrive
+                 mount, and adopt gdrive/gdrive-* remotes that are not mapped.
+  --add-account  Authorize one more Google account and prepare its mount.
+                 The same command adds the first account.
+  --reauth       Force a new OAuth login for one account. With a single
+                 configured account the argument is optional; otherwise pass an
+                 email address or an rclone remote name.
+
+Environment:
+  GDRIVE_ROOT    Parent folder for account mounts (default: ~/GoogleDrive)
+  RCLONE_BIN     rclone binary (default: rclone from PATH)
+
+First-time setup without your own OAuth client uses rclone's shared client,
+which is rate-limited and being retired during 2026. See:
+  https://rclone.org/drive/#making-your-own-client-id
+Documents are stored in ~/.config/omarchy-gdrive/setup.log.
+EOF
+}
+
+usage_error() {
+  printf 'error: %s\n' "$*" >&2
+  usage >&2
+  exit 2
+}
+
+mode=reconcile
+reauth_target=""
+while (( $# > 0 )); do
+  case "$1" in
+    --add-account|--add)
+      [[ "$mode" == reconcile ]] || usage_error "only one mode may be given"
+      mode=add
+      ;;
+    --reauth)
+      [[ "$mode" == reconcile ]] || usage_error "only one mode may be given"
+      mode=reauth
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      usage_error "unknown argument: $1"
+      ;;
+    *)
+      [[ "$mode" == reauth && -z "$reauth_target" ]] || usage_error "unknown argument: $1"
+      reauth_target="$1"
+      ;;
+  esac
+  shift
+done
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'warn: %s\n' "$*" >&2; }
+
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+
+conf_dir="$config_home/rclone"
+conf="$conf_dir/rclone.conf"
+cache_dir="$cache_home/rclone"
+unit_dir="$config_home/systemd/user"
+app_dir="$config_home/omarchy-gdrive"
+accounts="$app_dir/accounts.tsv"
+lock_file="$app_dir/setup.lock"
+bookmarks="$config_home/gtk-3.0/bookmarks"
+log_dir="$state_home/omarchy-gdrive"
+log="$log_dir/setup.log"
+
+gdrive_root="${GDRIVE_ROOT:-$HOME/GoogleDrive}"
+[[ "$gdrive_root" == /* ]] || die "GDRIVE_ROOT must be an absolute path: $gdrive_root"
+while [[ "$gdrive_root" == */ && "$gdrive_root" != / ]]; do
+  gdrive_root="${gdrive_root%/}"
+done
+
+rclone_bin="${RCLONE_BIN:-$(command -v rclone || true)}"
+
+email_re='^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$'
+valid_email() { [[ "$1" =~ $email_re ]]; }
+
+# Resolve a Drive account email from a token. argv[1] selects the stdin format:
+#   token   stdin is an rclone token JSON object
+#   config  stdin is "rclone config dump" output, argv[2] is the remote name
+# Prints the lowercased email address and never the token.
+read -r -d '' py_drive_email <<'PY' || true
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+RETRY = (403, 429, 500, 502, 503, 504)
+# 403 from the shared rclone client is a per-minute Drive API quota, so the
+# waits have to span a quota window instead of a few seconds.
+DELAYS = (10, 20, 30, 30)
+URL = "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress,displayName)"
+
+
+def access_token(mode, remote):
+    data = sys.stdin.read()
+    if mode == "config":
+        try:
+            dump = json.loads(data)
+        except ValueError:
+            sys.exit("could not parse the rclone configuration")
+        if remote not in dump:
+            sys.exit("the rclone configuration has no remote named %s" % remote)
+        token = dump[remote].get("token")
+        if not token:
+            sys.exit("rclone remote %s has no token" % remote)
+    else:
+        token = data
+    if isinstance(token, str):
+        try:
+            token = json.loads(token)
+        except ValueError:
+            sys.exit("rclone remote %s has an unreadable token" % remote)
+    if not isinstance(token, dict) or not token.get("access_token"):
+        sys.exit("rclone remote %s has no access token" % remote)
+    return token["access_token"]
+
+
+def main():
+    mode = sys.argv[1]
+    remote = sys.argv[2] if len(sys.argv) > 2 else ""
+    request = urllib.request.Request(
+        URL, headers={"Authorization": "Bearer " + access_token(mode, remote)}
+    )
+    error = "could not read the Google account email"
+    for attempt in range(len(DELAYS) + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.load(response)
+            email = str(payload["user"]["emailAddress"]).strip().lower()
+            if not email:
+                sys.exit("Google returned an empty account email")
+            print(email)
+            return
+        except urllib.error.HTTPError as exc:
+            error = "Google API returned HTTP %d" % exc.code
+            if exc.code == 403:
+                error += " (Drive API quota; rclone's shared client is rate limited)"
+            retry = exc.code in RETRY
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+            error = "could not read the Google account email: %s" % exc
+            retry = True
+        if not retry or attempt >= len(DELAYS):
+            break
+        delay = DELAYS[attempt]
+        sys.stderr.write("%s; retrying in %d s\n" % (error, delay))
+        sys.stderr.flush()
+        time.sleep(delay)
+    sys.exit(error)
+
+
+main()
+PY
+
+# Rewrite the Files sidebar: drop legacy and stale account entries, then add one
+# entry per mounted account. argv: bookmarks, GDRIVE_ROOT, $HOME, emails...
+read -r -d '' py_bookmarks <<'PY' || true
+import os
+import pathlib
+import re
+import sys
+from urllib.parse import unquote
+
+bookmarks = pathlib.Path(sys.argv[1])
+root = sys.argv[2]
+home = pathlib.Path(sys.argv[3])
+emails = sys.argv[4:]
+
+EMAIL = re.compile(r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$")
+legacy = str(home / "GoogleDrive")
+desired = ["%s %s" % (pathlib.Path(root, email).as_uri(), email) for email in emails]
+
+
+def decode(uri):
+    if not uri.startswith("file://"):
+        return None
+    return unquote(uri[len("file://"):])
+
+
+def keep(line):
+    if line in desired:
+        return False
+    parts = line.split(" ", 1)
+    path = decode(parts[0])
+    if path is None:
+        return True
+    label = parts[1].strip() if len(parts) > 1 else ""
+    if path == legacy and label == "Google Drive":
+        return False
+    if path.startswith(root + "/"):
+        segment = path[len(root) + 1:]
+        if "/" not in segment and EMAIL.match(segment):
+            return False
+    return True
+
+
+original = ""
+if bookmarks.exists():
+    original = bookmarks.read_text(encoding="utf-8", errors="surrogateescape")
+
+kept = [line for line in original.splitlines() if line.strip() and keep(line)]
+data = "".join(line + "\n" for line in kept + desired)
+if data == original:
+    sys.exit(0)
+
+bookmarks.parent.mkdir(parents=True, exist_ok=True)
+mode = bookmarks.stat().st_mode & 0o777 if bookmarks.exists() else 0o644
+tmp = bookmarks.parent / (".bookmarks.%d.tmp" % os.getpid())
+tmp.write_text(data, encoding="utf-8", errors="surrogateescape")
+os.chmod(tmp, mode)
+os.replace(tmp, bookmarks)
+PY
+
+mkdir -p "$conf_dir" "$cache_dir" "$unit_dir" "${bookmarks%/*}" "$log_dir" "$app_dir"
+chmod 700 "$app_dir"
+chmod 700 "$conf_dir"
+
+command -v flock >/dev/null || die "flock not found (install util-linux)"
+exec 9>"$lock_file"
+flock -n 9 || die "another setup is already running"
+
+exec > >(tee -a "$log") 2>&1
+printf '\n=== %s %s ===\n' "$(date -Is)" "$mode"
+
+[[ -n "$rclone_bin" && -x "$rclone_bin" ]] || die "rclone not found (install the rclone package)"
+command -v python3 >/dev/null || die "python3 not found (install the python package)"
+command -v fusermount3 >/dev/null || die "fusermount3 not found (install fuse3)"
+command -v systemctl >/dev/null || die "systemctl not found"
+command -v timeout >/dev/null || die "timeout not found (install coreutils)"
+command -v mountpoint >/dev/null || die "mountpoint not found (install util-linux)"
+[[ -c /dev/fuse ]] || die "/dev/fuse is missing"
+
+# --- rclone inventory -------------------------------------------------------
+
+all_remotes() {
+  "$rclone_bin" --config "$conf" listremotes 2>/dev/null | sed -e 's/:$//' -e '/^$/d'
+}
+
+remote_exists() {
+  all_remotes | grep -Fxq -- "$1"
+}
+
+remote_type() {
+  "$rclone_bin" --config "$conf" config show "$1" 2>/dev/null | sed -n 's/^type = //p' | head -1
+}
+
+# A managed remote is an rclone drive remote named gdrive or gdrive-*.
+is_managed_remote() {
+  local name=$1
+  [[ "$name" =~ ^gdrive(-.*)?$ ]] || return 1
+  [[ "$(remote_type "$name")" == drive ]]
+}
+
+managed_remotes() {
+  local remote
+  while IFS= read -r remote; do
+    [[ -n "$remote" ]] || continue
+    if is_managed_remote "$remote"; then
+      printf '%s\n' "$remote"
+    fi
+  done < <(all_remotes)
+  return 0
+}
+
+remote_client_id() {
+  "$rclone_bin" --config "$conf" config show "$1" 2>/dev/null | sed -n 's/^client_id = //p' | head -1
+}
+
+remote_client_secret() {
+  "$rclone_bin" --config "$conf" config show "$1" 2>/dev/null | sed -n 's/^client_secret = //p' | head -1
+}
+
+# First remote (in the given order) that carries a usable OAuth client.
+client_credentials() {
+  local remote id secret
+  for remote in "$@"; do
+    id="$(remote_client_id "$remote")"
+    secret="$(remote_client_secret "$remote")"
+    if [[ -n "$id" && -n "$secret" ]]; then
+      printf '%s\t%s\n' "$id" "$secret"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# --- account state ----------------------------------------------------------
+
+state_remote_for_email() {
+  [[ -s "$accounts" ]] || return 0
+  awk -F'\t' -v email="$1" '$1 == email { print $2; exit }' "$accounts"
+}
+
+state_email_for_remote() {
+  [[ -s "$accounts" ]] || return 0
+  awk -F'\t' -v remote="$1" '$2 == remote { print $1; exit }' "$accounts"
+}
+
+state_emails() {
+  [[ -s "$accounts" ]] || return 0
+  awk -F'\t' 'NF >= 2 && $1 != "" { print $1 }' "$accounts"
+}
+
+state_remotes() {
+  [[ -s "$accounts" ]] || return 0
+  awk -F'\t' 'NF >= 2 && $2 != "" { print $2 }' "$accounts"
+}
+
+# One account per email and one email per remote.
+state_upsert() {
+  local email=$1 remote=$2 tmp
+  tmp="$(mktemp "$app_dir/.accounts.XXXXXX")"
+  if [[ -s "$accounts" ]]; then
+    awk -F'\t' -v email="$email" -v remote="$remote" '$1 != email && $2 != remote' "$accounts" >"$tmp"
+  fi
+  printf '%s\t%s\n' "$email" "$remote" >>"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$accounts"
+}
+
+# --- email resolution -------------------------------------------------------
+
+resolve_email_for_remote() {
+  local remote=$1 email
+  # Refresh first so an expired access token is renewed and persisted.
+  timeout 60 "$rclone_bin" --config "$conf" lsd "$remote:" --max-depth 1 >/dev/null 2>&1 || true
+  email="$("$rclone_bin" --config "$conf" config dump 2>/dev/null |
+    python3 -c "$py_drive_email" config "$remote")" || return 1
+  if ! valid_email "$email"; then
+    warn "unexpected account email for remote $remote: $email"
+    return 1
+  fi
+  printf '%s\n' "$email"
+}
+
+# Reads the freshly authorized token JSON object from stdin.
+resolve_email_for_token() {
+  local email
+  email="$(python3 -c "$py_drive_email" token)" || return 1
+  if ! valid_email "$email"; then
+    warn "unexpected account email: $email"
+    return 1
+  fi
+  printf '%s\n' "$email"
+}
+
+remote_name_for_email() {
+  python3 -c 'import hashlib, re, sys
+email = sys.argv[1]
+slug = re.sub(r"[^a-z0-9._-]+", "-", email.split("@", 1)[0].lower()).strip("-.")
+slug = slug[:40] or "account"
+print("gdrive-%s-%s" % (slug, hashlib.sha256(email.encode()).hexdigest()[:8]))' "$1"
+}
+
+# --- rclone configuration ---------------------------------------------------
+
+# Prints the token JSON object produced by "rclone authorize".
+authorize_token() {
+  local -a auth=(drive)
+  local raw last
+  if [[ -n "${1:-}" && -n "${2:-}" ]]; then
+    auth+=("$1" "$2")
+  fi
+  printf 'Sign in and allow rclone in the browser window that opens.\n' >&2
+  raw="$("$rclone_bin" --config "$conf" authorize "${auth[@]}")" || return 1
+  last="$(printf '%s\n' "$raw" | awk '/^\{.*\}$/ { line = $0 } END { print line }')"
+  [[ "$last" == '{"access_token":'* ]] || return 1
+  printf '%s\n' "$last"
+}
+
+create_remote() {
+  local remote=$1 token=$2 client_id=${3:-} client_secret=${4:-}
+  (
+    umask 077
+    {
+      printf '\n[%s]\n' "$remote"
+      printf 'type = drive\n'
+      printf 'scope = drive\n'
+      printf 'token = %s\n' "$token"
+      if [[ -n "$client_id" && -n "$client_secret" ]]; then
+        printf 'client_id = %s\n' "$client_id"
+        printf 'client_secret = %s\n' "$client_secret"
+      fi
+    } >>"$conf"
+  )
+  chmod 600 "$conf"
+}
+
+# Strip credentials from rclone output before it can reach the log.
+redact() {
+  sed -E 's/(access_token"?[[:space:]]*[:=][[:space:]]*"?)[^",[:space:]]+/\1<redacted>/g; s/(refresh_token"?[[:space:]]*[:=][[:space:]]*"?)[^",[:space:]]+/\1<redacted>/g; s/(client_secret[[:space:]]*=[[:space:]]*).*/\1<redacted>/g'
+}
+
+# Without --non-interactive, "config update" re-runs the drive backend's OAuth
+# prompt and prints the remote section, token included.
+update_token() {
+  local remote=$1 token=$2 client_id=${3:-} client_secret=${4:-}
+  local -a args=(config update "$remote" token "$token" --non-interactive)
+  local output
+  # Refreshing a token needs the OAuth client that issued it.
+  if [[ -n "$client_id" && -n "$client_secret" ]] && [[ -z "$(remote_client_id "$remote")" ]]; then
+    args+=(client_id "$client_id" client_secret "$client_secret")
+  fi
+  if ! output="$("$rclone_bin" --config "$conf" "${args[@]}" 2>&1)"; then
+    printf '%s\n' "$output" | redact >&2
+    return 1
+  fi
+}
+
+# --- systemd ----------------------------------------------------------------
+
+unit_for_remote() { printf '%s\n' "$unit_dir/rclone-$1.service"; }
+unit_name_for_remote() { printf 'rclone-%s.service\n' "$1"; }
+
+stop_unit() { systemctl --user stop "$(unit_name_for_remote "$1")" >/dev/null 2>&1 || true; }
+start_unit() { systemctl --user restart "$(unit_name_for_remote "$1")" >/dev/null 2>&1 || true; }
+
+# Mount path recorded in a unit file, empty when there is none.
+unit_mount() {
+  [[ -f "$1" ]] || return 0
+  sed -n 's/^ExecStart=.* mount "[^"]*" "\([^"]*\)".*/\1/p' "$1" | head -1
+}
+
+# --- account setup ----------------------------------------------------------
+
+setup_account() {
+  local email=$1 remote=$2
+  local mount="$gdrive_root/$email"
+  local unit unit_name old_mount remote_name
+  unit="$(unit_for_remote "$remote")"
+  unit_name="$(unit_name_for_remote "$remote")"
+
+  old_mount="$(unit_mount "$unit")"
+  if [[ -n "$old_mount" && "$old_mount" != "$mount" ]]; then
+    printf 'Moving %s from %s to %s\n' "$remote" "$old_mount" "$mount"
+    stop_unit "$remote"
+    if mountpoint -q "$old_mount" 2>/dev/null; then
+      fusermount3 -uz "$old_mount" >/dev/null 2>&1 || true
+    fi
+    rmdir "$old_mount" 2>/dev/null || true
+  fi
+
+  # Never create account folders inside a live 0.1.0 mount.
+  if mountpoint -q "$gdrive_root" 2>/dev/null; then
+    printf 'Unmounting the single-account layout at %s\n' "$gdrive_root"
+    while IFS= read -r remote_name; do
+      [[ -n "$remote_name" ]] || continue
+      if [[ "$(unit_mount "$(unit_for_remote "$remote_name")")" == "$gdrive_root" ]]; then
+        stop_unit "$remote_name"
+      fi
+    done < <(managed_remotes)
+    fusermount3 -uz "$gdrive_root" >/dev/null 2>&1 || true
+    local attempt
+    for attempt in 1 2 3 4 5; do
+      mountpoint -q "$gdrive_root" 2>/dev/null || break
+      sleep 1
+    done
+    if mountpoint -q "$gdrive_root" 2>/dev/null; then
+      die "could not unmount $gdrive_root; stop the old mount and run this again"
+    fi
+  fi
+
+  mkdir -p "$mount"
+
+  # Clear a stale FUSE mount left by a killed or failed rclone process.
+  if mountpoint -q "$mount" && ! timeout 5 ls -A "$mount" >/dev/null 2>&1; then
+    printf 'Clearing stale mount at %s\n' "$mount"
+    fusermount3 -uz "$mount" >/dev/null 2>&1 || true
+  fi
+
+  # The cache makes Nautilus, thumbnailers, and editors behave like a normal disk.
+  cat >"$unit" <<EOF
+[Unit]
+Description=Google Drive ($email)
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+ExecStartPre=/usr/bin/mkdir -p "$mount"
+ExecStart="$rclone_bin" mount "$remote:" "$mount" --config "$conf" --cache-dir "$cache_dir" --vfs-cache-mode full --vfs-cache-max-size 10G --vfs-cache-max-age 168h --vfs-read-chunk-size 32M --vfs-read-chunk-size-limit 1G --dir-cache-time 1h --poll-interval 1m --umask 022 --log-level INFO
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+
+  systemctl --user daemon-reload
+  systemctl --user enable "$unit_name" >/dev/null
+  systemctl --user restart "$unit_name" || true
+
+  local attempt
+  for attempt in $(seq 1 30); do
+    mountpoint -q "$mount" && break
+    sleep 1
+  done
+
+  if ! mountpoint -q "$mount"; then
+    systemctl --user status --no-pager "$unit_name" || true
+    journalctl --user -u "$unit_name" -n 40 --no-pager || true
+    printf 'error: %s is not mounted\n' "$mount" >&2
+    return 1
+  fi
+
+  printf '%s mounted at %s (service %s).\n' "$email" "$mount" "$unit_name"
+  return 0
+}
+
+# --- Files sidebar ----------------------------------------------------------
+
+bookmark_sync() {
+  local -a emails=()
+  local email
+  while IFS= read -r email; do
+    [[ -n "$email" ]] || continue
+    mountpoint -q "$gdrive_root/$email" || continue
+    emails+=("$email")
+  done < <(state_emails)
+  python3 -c "$py_bookmarks" "$bookmarks" "$gdrive_root" "$HOME" ${emails[@]+"${emails[@]}"}
+}
+
+join_by() {
+  local sep=$1 out="" item
+  shift
+  for item in "$@"; do
+    out+="${out:+$sep}$item"
+  done
+  printf '%s\n' "$out"
+}
+
+# --- modes ------------------------------------------------------------------
+
+reconcile() {
+  local failures=0
+  local -a managed=()
+  local remote email
+
+  mapfile -t managed < <(managed_remotes)
+
+  if [[ ! -s "$accounts" ]]; then
+    if (( ${#managed[@]} == 0 )); then
+      printf 'No Google Drive accounts configured yet.\n'
+      add_account
+      return $?
+    fi
+    for remote in "${managed[@]}"; do
+      if email="$(resolve_email_for_remote "$remote")"; then
+        state_upsert "$email" "$remote"
+        printf 'Found account %s (remote %s).\n' "$email" "$remote"
+      else
+        warn "could not resolve the account for remote $remote; run omarchy-gdrive-setup --reauth $remote"
+        failures=1
+      fi
+    done
+  fi
+
+  while IFS=$'\t' read -r email remote; do
+    [[ -n "${email:-}" && -n "${remote:-}" ]] || continue
+    if ! remote_exists "$remote" || [[ "$(remote_type "$remote")" != drive ]]; then
+      warn "account $email maps to remote $remote, which is missing or is not a Drive remote"
+      failures=1
+      continue
+    fi
+    if ! setup_account "$email" "$remote"; then
+      warn "account $email is not ready; run omarchy-gdrive-setup --reauth $email"
+      failures=1
+    fi
+  done <"$accounts"
+
+  # Adopt managed remotes that predate the state file.
+  mapfile -t managed < <(managed_remotes)
+  for remote in "${managed[@]}"; do
+    [[ -z "$(state_email_for_remote "$remote")" ]] || continue
+    if email="$(resolve_email_for_remote "$remote")"; then
+      if [[ -n "$(state_remote_for_email "$email")" ]]; then
+        warn "remote $remote also points at $email; leaving it unmapped"
+        continue
+      fi
+      state_upsert "$email" "$remote"
+      if ! setup_account "$email" "$remote"; then
+        failures=1
+      fi
+    else
+      warn "managed remote $remote is not mapped to an account and its email could not be resolved"
+      failures=1
+    fi
+  done
+
+  bookmark_sync
+  if (( failures != 0 )); then
+    printf 'Finished with errors: some accounts need attention.\n'
+    return 1
+  fi
+  printf 'All accounts are mounted and listed in Files.\n'
+  return 0
+}
+
+add_account() {
+  local -a candidates=()
+  local creds client_id="" client_secret=""
+  local token email remote existing resolved
+  local -a managed=()
+
+  mapfile -t candidates < <(state_remotes; managed_remotes)
+  creds="$(client_credentials ${candidates[@]+"${candidates[@]}"})"
+  if [[ -n "$creds" ]]; then
+    client_id="${creds%%$'\t'*}"
+    client_secret="${creds#*$'\t'}"
+  fi
+
+  if [[ -n "$client_id" && -n "$client_secret" ]]; then
+    printf 'Using the OAuth client configured for an existing account.\n'
+  else
+    printf "Using rclone's shared OAuth client (rate-limited and being retired).\n"
+    printf 'See https://rclone.org/drive/#making-your-own-client-id\n'
+  fi
+  token="$(authorize_token "$client_id" "$client_secret")" || die "authorization failed; no changes were made"
+
+  email="$(printf '%s' "$token" | resolve_email_for_token)" ||
+    die "could not determine the authorized account email; no changes were made"
+
+  existing="$(state_remote_for_email "$email")"
+  if [[ -n "$existing" ]] && remote_exists "$existing"; then
+    stop_unit "$existing"
+    if ! update_token "$existing" "$token" "$client_id" "$client_secret"; then
+      start_unit "$existing"
+      die "could not update the token for remote $existing; it still uses the previous token"
+    fi
+    state_upsert "$email" "$existing"
+    setup_account "$email" "$existing" || exit 1
+    bookmark_sync
+    printf 'Account %s is already configured; token updated.\n' "$email"
+    return 0
+  fi
+
+  # An unlisted managed remote may already belong to this account.
+  mapfile -t managed < <(managed_remotes)
+  for remote in "${managed[@]}"; do
+    [[ -z "$(state_email_for_remote "$remote")" ]] || continue
+    resolved="$(resolve_email_for_remote "$remote" || true)"
+    if [[ "$resolved" == "$email" ]]; then
+      stop_unit "$remote"
+      if ! update_token "$remote" "$token" "$client_id" "$client_secret"; then
+        start_unit "$remote"
+        die "could not update the token for remote $remote; it still uses the previous token"
+      fi
+      state_upsert "$email" "$remote"
+      setup_account "$email" "$remote" || exit 1
+      bookmark_sync
+      printf 'Account %s is already configured; token updated.\n' "$email"
+      return 0
+    fi
+  done
+
+  remote="$existing"
+  if [[ -z "$remote" && -z "$(all_remotes | grep -Fx gdrive || true)" ]]; then
+    remote=gdrive
+  fi
+  if [[ -z "$remote" ]] || remote_exists "$remote"; then
+    remote="$(remote_name_for_email "$email")"
+    if remote_exists "$remote"; then
+      die "remote $remote already exists; run omarchy-gdrive-setup --reauth $remote"
+    fi
+  fi
+
+  create_remote "$remote" "$token" "$client_id" "$client_secret"
+  state_upsert "$email" "$remote"
+  printf 'Created rclone remote %s for %s.\n' "$remote" "$email"
+  setup_account "$email" "$remote" || exit 1
+  bookmark_sync
+  printf 'Account %s is ready.\n' "$email"
+  return 0
+}
+
+reauth() {
+  local target="$reauth_target"
+  local email="" remote="" expected="" token resolved
+  local -a managed=() emails=()
+  local creds client_id="" client_secret=""
+
+  mapfile -t managed < <(managed_remotes)
+
+  if [[ -n "$target" ]]; then
+    if [[ "$target" == *@* ]]; then
+      email="${target,,}"
+      remote="$(state_remote_for_email "$email")"
+      [[ -n "$remote" ]] || die "account $email is not configured"
+      expected="$email"
+    else
+      remote="$target"
+      remote_exists "$remote" || die "rclone remote $remote does not exist"
+      [[ "$(remote_type "$remote")" == drive ]] || die "rclone remote $remote is not a Drive remote"
+      expected="$(state_email_for_remote "$remote")"
+    fi
+  else
+    mapfile -t emails < <(state_emails)
+    if (( ${#emails[@]} == 1 )); then
+      email="${emails[0]}"
+      remote="$(state_remote_for_email "$email")"
+      expected="$email"
+    elif (( ${#emails[@]} > 1 )); then
+      die "multiple accounts are configured; pass an email or remote: $(join_by ', ' "${emails[@]}")"
+    elif remote_exists gdrive && [[ "$(remote_type gdrive)" == drive ]]; then
+      remote=gdrive
+    elif (( ${#managed[@]} == 1 )); then
+      remote="${managed[0]}"
+    elif (( ${#managed[@]} == 0 )); then
+      die "no Google Drive remote found; run omarchy-gdrive-setup --add-account"
+    else
+      die "multiple managed remotes; pass one of: $(join_by ', ' "${managed[@]}")"
+    fi
+  fi
+
+  if [[ -z "$expected" ]] && remote_exists "$remote"; then
+    expected="$(resolve_email_for_remote "$remote" || true)"
+  fi
+
+  mapfile -t emails < <(state_remotes)
+  creds="$(client_credentials ${emails[@]+"${emails[@]}"} "$remote")"
+  if [[ -n "$creds" ]]; then
+    client_id="${creds%%$'\t'*}"
+    client_secret="${creds#*$'\t'}"
+  fi
+
+  if [[ -n "$client_id" && -n "$client_secret" ]]; then
+    printf 'Using the OAuth client configured for remote %s.\n' "$remote"
+  else
+    printf "Using rclone's shared OAuth client (rate-limited and being retired).\n"
+    printf 'See https://rclone.org/drive/#making-your-own-client-id\n'
+  fi
+  token="$(authorize_token "$client_id" "$client_secret")" || die "authorization failed; no changes were made"
+
+  resolved="$(printf '%s' "$token" | resolve_email_for_token)" ||
+    die "could not determine the authorized account email; no changes were made"
+  if [[ -n "$expected" && "$resolved" != "$expected" ]]; then
+    die "authorized $resolved but remote $remote belongs to $expected; no changes were made"
+  fi
+
+  stop_unit "$remote"
+  if ! update_token "$remote" "$token" "$client_id" "$client_secret"; then
+    start_unit "$remote"
+    die "could not update the token for remote $remote; it still uses the previous token"
+  fi
+  state_upsert "$resolved" "$remote"
+  setup_account "$resolved" "$remote" || exit 1
+  bookmark_sync
+  printf 'Account %s is authorized and mounted.\n' "$resolved"
+  return 0
+}
+
+case "$mode" in
+  reconcile)
+    reconcile || exit 1
+    ;;
+  add)
+    add_account
+    ;;
+  reauth)
+    reauth
+    ;;
+esac

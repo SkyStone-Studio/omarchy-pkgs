@@ -1,0 +1,4 @@
+repo/
+packages/*/src/
+packages/*/pkg/
+packages/*/*.pkg.tar.*
