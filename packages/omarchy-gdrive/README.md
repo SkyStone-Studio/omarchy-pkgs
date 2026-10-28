@@ -9,6 +9,9 @@ and starts at login.
 
 - Every account is mounted at `~/GoogleDrive/<email>` and appears in the Files
   sidebar as `<email>`.
+- Every Google Shared drive the account can see is mounted at
+  `~/GoogleDrive/Shared drives/<email>/<drive>` with its own service and sidebar
+  entry.
 - **Add Google Drive Account…** in the Files background right-click menu
   authorizes one more account and creates its mount, service, and sidebar
   entry.
@@ -81,6 +84,36 @@ nautilus --quit
 ```
 
 Then open **Files** again.
+
+## Shared drives
+
+Google Shared drives (formerly Team drives) are separate Drive roots, so each
+one gets its own mount beside the account's My Drive mount:
+
+```text
+~/GoogleDrive/marcelo@example.com                     My Drive
+~/GoogleDrive/Shared drives/marcelo@example.com/Clients
+~/GoogleDrive/Shared drives/marcelo@example.com/Corporate
+```
+
+`omarchy-gdrive-setup` lists the drives with `rclone backend drives` on every
+run, writes one `rclone-<remote>-shared-<drive>.service` per drive, and adds a
+`<drive> (<email>)` bookmark for each mounted drive. Drives that disappear from
+the account are unmounted, and their units and bookmarks are removed.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `GDRIVE_SHARED_DRIVES` | `on` | `off` stops and removes every shared-drive mount |
+| `GDRIVE_SHARED_WITH_ME` | `off` | `1` adds a `~/GoogleDrive/Shared with me/<email>` mount using `--drive-shared-with-me` |
+
+Every mount keeps its own 10 GiB VFS cache budget, so N shared drives can use up
+to N x 10 GiB of `~/.cache/rclone` under heavy offline use. Lower
+`--vfs-cache-max-size` in the generated units if that matters.
+
+Listing shared drives costs one Drive API call per account per run. With
+rclone's shared OAuth client that call can take 15-30 s, which makes a setup run
+with several drives slower than the My Drive-only version; a user OAuth client
+makes it fast.
 
 ## Add an account
 
@@ -193,6 +226,10 @@ script.
   before the mount existed.
 - **`RATE_LIMIT_EXCEEDED`, 403, or long stalls**: switch to your own OAuth
   client as described above.
+- **A shared drive is missing**: `systemctl --user status
+  rclone-<remote>-shared-<drive>.service`. A drive you were removed from is
+  dropped on the next `omarchy-gdrive-setup`; a newly granted drive appears on the
+  next run.
 - **Stale FUSE mount** (`Transport endpoint is not connected`): the setup
   script clears it automatically. Manually:
   `fusermount3 -uz ~/GoogleDrive/<email>`, then rerun `omarchy-gdrive-setup`.
@@ -229,10 +266,12 @@ sudo pacman -R omarchy-gdrive
 The package does not own per-user data, so it leaves these behind:
 
 - `~/GoogleDrive/<email>` folders (one per account)
+- `~/GoogleDrive/Shared drives/` and `~/GoogleDrive/Shared with me/` mounts and
+  their empty parent folders
 - `~/.config/omarchy-gdrive/` (`accounts.tsv`, `setup.lock`)
 - `~/.config/rclone/rclone.conf` (remove only the `gdrive*` sections if you use
   other rclone remotes)
-- the `<email>` lines in `~/.config/gtk-3.0/bookmarks`
+- the `<email>` and `<drive> (<email>)` lines in `~/.config/gtk-3.0/bookmarks`
 - `~/.local/state/omarchy-gdrive/`
 
 Delete them by hand after unmounting (`fusermount3 -uz ~/GoogleDrive/<email>`).

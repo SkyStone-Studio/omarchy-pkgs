@@ -32,8 +32,13 @@ Modes:
                  email address or an rclone remote name.
 
 Environment:
-  GDRIVE_ROOT    Parent folder for account mounts (default: ~/GoogleDrive)
-  RCLONE_BIN     rclone binary (default: rclone from PATH)
+  GDRIVE_ROOT            Parent folder for account mounts (default: ~/GoogleDrive)
+  GDRIVE_SHARED_DRIVES   Mount every Google Shared drive (default: on, set off to skip)
+  GDRIVE_SHARED_WITH_ME  Also mount "Shared with me" (default: off)
+  RCLONE_BIN             rclone binary (default: rclone from PATH)
+
+Each account also gets ~/GoogleDrive/Shared drives/<email>/<drive> for every
+Google Shared drive it can see, one service per drive.
 
 First-time setup without your own OAuth client uses rclone's shared client,
 which is rate-limited and being retired during 2026. See:
@@ -194,11 +199,19 @@ from urllib.parse import unquote
 bookmarks = pathlib.Path(sys.argv[1])
 root = sys.argv[2]
 home = pathlib.Path(sys.argv[3])
-emails = sys.argv[4:]
 
 EMAIL = re.compile(r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$")
 legacy = str(home / "GoogleDrive")
-desired = ["%s %s" % (pathlib.Path(root, email).as_uri(), email) for email in emails]
+shared_root = root + "/Shared drives/"
+with_me_root = root + "/Shared with me/"
+
+pairs = []
+for raw in sys.stdin.read().splitlines():
+    if not raw.strip():
+        continue
+    mount, label = raw.split("\t", 1)
+    pairs.append((mount, label))
+desired = ["%s %s" % (pathlib.Path(mount).as_uri(), label) for mount, label in pairs]
 
 
 def decode(uri):
@@ -221,6 +234,14 @@ def keep(line):
         segment = path[len(root) + 1:]
         if "/" not in segment and EMAIL.match(segment):
             return False
+    if path.startswith(shared_root):
+        bits = path[len(shared_root):].split("/")
+        if len(bits) == 2 and EMAIL.match(bits[0]):
+            return False
+    if path.startswith(with_me_root):
+        segment = path[len(with_me_root):]
+        if "/" not in segment and EMAIL.match(segment):
+            return False
     return True
 
 
@@ -239,6 +260,28 @@ tmp = bookmarks.parent / (".bookmarks.%d.tmp" % os.getpid())
 tmp.write_text(data, encoding="utf-8", errors="surrogateescape")
 os.chmod(tmp, mode)
 os.replace(tmp, bookmarks)
+PY
+
+# Turn "rclone backend drives" output into id<TAB>name<TAB>unit-slug lines.
+read -r -d '' py_shared_drives <<'PY' || true
+import hashlib
+import json
+import re
+import sys
+
+try:
+    drives = json.load(sys.stdin)
+except ValueError:
+    sys.exit("could not parse the shared drive list")
+if isinstance(drives, dict):
+    drives = [drives]
+for drive in drives:
+    name = str(drive.get("name") or "").strip()
+    drive_id = str(drive.get("id") or "").strip()
+    if not name or not drive_id:
+        continue
+    slug = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-.")[:40] or "drive"
+    print("%s\t%s\t%s-%s" % (drive_id, name, slug, hashlib.sha256(drive_id.encode()).hexdigest()[:8]))
 PY
 
 mkdir -p "$conf_dir" "$cache_dir" "$unit_dir" "${bookmarks%/*}" "$log_dir" "$app_dir"
@@ -451,6 +494,56 @@ unit_mount() {
   sed -n 's/^ExecStart=.* mount "[^"]*" "\([^"]*\)".*/\1/p' "$1" | head -1
 }
 
+# Render one mount unit. Extra arguments are appended verbatim to ExecStart, so
+# callers must quote any value that may contain spaces.
+write_unit() {
+  local unit=$1 description=$2 mount=$3 remote=$4
+  local extra=${5:-}
+  local tmp="$unit.tmp"
+  cat >"$tmp" <<EOF
+[Unit]
+Description=$description
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+ExecStartPre=/usr/bin/mkdir -p "$mount"
+ExecStart="$rclone_bin" mount "$remote:" "$mount" --config "$conf" --cache-dir "$cache_dir" --vfs-cache-mode full --vfs-cache-max-size 10G --vfs-cache-max-age 168h --vfs-read-chunk-size 32M --vfs-read-chunk-size-limit 1G --dir-cache-time 1h --poll-interval 1m --umask 022 --log-level INFO${extra:+ $extra}
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+  # An unchanged unit that is already running needs no restart.
+  if cmp -s "$tmp" "$unit"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$unit"
+  return 0
+}
+
+start_unit_and_wait() {
+  local unit_name=$1 mount=$2 label=$3 attempt
+  systemctl --user daemon-reload
+  systemctl --user enable "$unit_name" >/dev/null
+  systemctl --user restart "$unit_name" || true
+  for attempt in $(seq 1 30); do
+    if mountpoint -q "$mount"; then
+      break
+    fi
+    sleep 1
+  done
+  if ! mountpoint -q "$mount"; then
+    systemctl --user status --no-pager "$unit_name" || true
+    journalctl --user -u "$unit_name" -n 40 --no-pager || true
+    printf 'error: %s is not mounted\n' "$mount" >&2
+    return 1
+  fi
+  printf '%s mounted at %s (service %s).\n' "$label" "$mount" "$unit_name"
+}
+
 # --- account setup ----------------------------------------------------------
 
 setup_account() {
@@ -499,54 +592,217 @@ setup_account() {
   fi
 
   # The cache makes Nautilus, thumbnailers, and editors behave like a normal disk.
-  cat >"$unit" <<EOF
-[Unit]
-Description=Google Drive ($email)
-StartLimitIntervalSec=0
-
-[Service]
-Type=notify
-ExecStartPre=/usr/bin/mkdir -p "$mount"
-ExecStart="$rclone_bin" mount "$remote:" "$mount" --config "$conf" --cache-dir "$cache_dir" --vfs-cache-mode full --vfs-cache-max-size 10G --vfs-cache-max-age 168h --vfs-read-chunk-size 32M --vfs-read-chunk-size-limit 1G --dir-cache-time 1h --poll-interval 1m --umask 022 --log-level INFO
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=default.target
-EOF
-
-  systemctl --user daemon-reload
-  systemctl --user enable "$unit_name" >/dev/null
-  systemctl --user restart "$unit_name" || true
-
-  local attempt
-  for attempt in $(seq 1 30); do
-    mountpoint -q "$mount" && break
-    sleep 1
-  done
-
+  local restart=0
+  if write_unit "$unit" "Google Drive ($email)" "$mount" "$remote"; then
+    restart=1
+  fi
+  if ! systemctl --user is-active --quiet "$unit_name"; then
+    restart=1
+  fi
   if ! mountpoint -q "$mount"; then
-    systemctl --user status --no-pager "$unit_name" || true
-    journalctl --user -u "$unit_name" -n 40 --no-pager || true
-    printf 'error: %s is not mounted\n' "$mount" >&2
-    return 1
+    restart=1
+  fi
+  if ((restart == 1)); then
+    start_unit_and_wait "$unit_name" "$mount" "$email"
+  else
+    printf '%s is already mounted at %s (service %s).\n' "$email" "$mount" "$unit_name"
+  fi
+}
+
+# --- shared drives ----------------------------------------------------------
+
+disabled() { case "${1,,}" in off|0|false|no) return 0 ;; *) return 1 ;; esac; }
+enabled() { case "${1,,}" in 1|on|true|yes) return 0 ;; *) return 1 ;; esac; }
+
+shared_drives() {
+  timeout 90 "$rclone_bin" --config "$conf" backend drives "$1:" 2>/dev/null |
+    python3 -c "$py_shared_drives"
+}
+
+# Drop units and mounts for shared drives that no longer exist (or that the
+# user switched off).
+prune_shared_units() {
+  local remote=$1
+  shift
+  local -a keep=("$@")
+  local unit unit_name mount candidate kept
+  for unit in "$unit_dir/rclone-$remote-shared-"*.service; do
+    [[ -f "$unit" ]] || continue
+    unit_name=${unit##*/}
+    kept=0
+    if ((${#keep[@]})); then
+      for candidate in "${keep[@]}"; do
+        if [[ "$candidate" == "$unit_name" ]]; then
+          kept=1
+          break
+        fi
+      done
+    fi
+    if ((kept == 1)); then
+      continue
+    fi
+    mount="$(unit_mount "$unit")"
+    printf 'Removing shared mount %s\n' "${mount:-$unit_name}"
+    systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
+    if [[ -n "$mount" ]] && mountpoint -q "$mount" 2>/dev/null; then
+      fusermount3 -uz "$mount" >/dev/null 2>&1 || true
+    fi
+    rm -f "$unit"
+    if [[ -n "$mount" ]]; then
+      rmdir "$mount" 2>/dev/null || true
+      rmdir "${mount%/*}" 2>/dev/null || true
+    fi
+  done
+  systemctl --user daemon-reload
+}
+
+# Google Shared drives are separate Drive roots, so each one gets its own mount
+# next to the account's My Drive mount: ~/GoogleDrive/Shared drives/<email>/<name>.
+setup_shared_drives() {
+  local email=$1 remote=$2
+  local base="$gdrive_root/Shared drives/$email"
+  local -a mounts=() units=() labels=() keep=() restart=() start_units=() start_mounts=()
+  local drives="" id name slug mount unit_name unit pending failures=0 attempt index need
+
+  if ! disabled "${GDRIVE_SHARED_DRIVES:-on}"; then
+    if ! drives="$(shared_drives "$remote")"; then
+      warn "could not list shared drives for $email; existing shared mounts are left untouched"
+      return 0
+    fi
+    if [[ -n "$drives" ]]; then
+      mkdir -p "$base"
+      while IFS=$'\t' read -r id name slug; do
+        [[ -n "${id:-}" && -n "${name:-}" && -n "${slug:-}" ]] || continue
+        mount="$base/$name"
+        unit_name="rclone-$remote-shared-$slug.service"
+        unit="$unit_dir/$unit_name"
+        mkdir -p "$mount"
+        if mountpoint -q "$mount" && ! timeout 5 ls -A "$mount" >/dev/null 2>&1; then
+          printf 'Clearing stale mount at %s\n' "$mount"
+          fusermount3 -uz "$mount" >/dev/null 2>&1 || true
+        fi
+        need=0
+        if write_unit "$unit" "Google Drive ($email) — $name" "$mount" "$remote" \
+          "--drive-team-drive \"$id\""; then
+          need=1
+        fi
+        if ! systemctl --user is-active --quiet "$unit_name"; then
+          need=1
+        fi
+        if ! mountpoint -q "$mount"; then
+          need=1
+        fi
+        keep+=("$unit_name")
+        mounts+=("$mount")
+        units+=("$unit_name")
+        labels+=("$name ($email)")
+        restart+=("$need")
+      done <<<"$drives"
+    fi
   fi
 
-  printf '%s mounted at %s (service %s).\n' "$email" "$mount" "$unit_name"
-  return 0
+  if enabled "${GDRIVE_SHARED_WITH_ME:-off}"; then
+    mount="$gdrive_root/Shared with me/$email"
+    unit_name="rclone-$remote-shared-with-me.service"
+    unit="$unit_dir/$unit_name"
+    mkdir -p "$mount"
+    if mountpoint -q "$mount" && ! timeout 5 ls -A "$mount" >/dev/null 2>&1; then
+      fusermount3 -uz "$mount" >/dev/null 2>&1 || true
+    fi
+    need=0
+    if write_unit "$unit" "Google Drive ($email) — Shared with me" "$mount" "$remote" \
+      "--drive-shared-with-me"; then
+      need=1
+    fi
+    if ! systemctl --user is-active --quiet "$unit_name"; then
+      need=1
+    fi
+    if ! mountpoint -q "$mount"; then
+      need=1
+    fi
+    keep+=("$unit_name")
+    mounts+=("$mount")
+    units+=("$unit_name")
+    labels+=("Shared with me ($email)")
+    restart+=("$need")
+  fi
+
+  for index in "${!mounts[@]}"; do
+    if ((restart[index] == 1)); then
+      start_units+=("${units[$index]}")
+      start_mounts+=("${mounts[$index]}")
+    fi
+  done
+
+  if ((${#start_units[@]})); then
+    systemctl --user daemon-reload
+    for unit_name in "${start_units[@]}"; do
+      systemctl --user enable "$unit_name" >/dev/null
+      systemctl --user restart "$unit_name" || true
+    done
+    for attempt in $(seq 1 45); do
+      pending=0
+      for mount in "${start_mounts[@]}"; do
+        if ! mountpoint -q "$mount"; then
+          pending=1
+        fi
+      done
+      if ((pending == 0)); then
+        break
+      fi
+      sleep 1
+    done
+  fi
+
+  for index in "${!mounts[@]}"; do
+    if ! mountpoint -q "${mounts[$index]}"; then
+      systemctl --user status --no-pager "${units[$index]}" || true
+      journalctl --user -u "${units[$index]}" -n 40 --no-pager || true
+      printf 'error: %s is not mounted\n' "${mounts[$index]}" >&2
+      failures=1
+    elif ((restart[index] == 1)); then
+      printf '%s mounted at %s (service %s).\n' \
+        "${labels[$index]}" "${mounts[$index]}" "${units[$index]}"
+    else
+      printf '%s is already mounted at %s (service %s).\n' \
+        "${labels[$index]}" "${mounts[$index]}" "${units[$index]}"
+    fi
+  done
+
+  prune_shared_units "$remote" ${keep[@]+"${keep[@]}"}
+  return $failures
 }
 
 # --- Files sidebar ----------------------------------------------------------
 
 bookmark_sync() {
-  local -a emails=()
-  local email
+  local -a pairs=()
+  local email dir account name
   while IFS= read -r email; do
     [[ -n "$email" ]] || continue
     mountpoint -q "$gdrive_root/$email" || continue
-    emails+=("$email")
+    pairs+=("$gdrive_root/$email"$'\t'"$email")
   done < <(state_emails)
-  python3 -c "$py_bookmarks" "$bookmarks" "$gdrive_root" "$HOME" ${emails[@]+"${emails[@]}"}
+
+  for dir in "$gdrive_root/Shared drives"/*/*; do
+    [[ -d "$dir" ]] || continue
+    mountpoint -q "$dir" || continue
+    name="${dir##*/}"
+    account="${dir%/*}"
+    pairs+=("$dir"$'\t'"$name (${account##*/})")
+  done
+
+  for dir in "$gdrive_root/Shared with me"/*; do
+    [[ -d "$dir" ]] || continue
+    mountpoint -q "$dir" || continue
+    pairs+=("$dir"$'\t'"Shared with me (${dir##*/})")
+  done
+
+  if ((${#pairs[@]})); then
+    printf '%s\n' "${pairs[@]}" | python3 -c "$py_bookmarks" "$bookmarks" "$gdrive_root" "$HOME"
+  else
+    python3 -c "$py_bookmarks" "$bookmarks" "$gdrive_root" "$HOME" </dev/null
+  fi
 }
 
 join_by() {
@@ -594,6 +850,9 @@ reconcile() {
     if ! setup_account "$email" "$remote"; then
       warn "account $email is not ready; run omarchy-gdrive-setup --reauth $email"
       failures=1
+    elif ! setup_shared_drives "$email" "$remote"; then
+      warn "some shared drives for $email are not mounted"
+      failures=1
     fi
   done <"$accounts"
 
@@ -608,6 +867,8 @@ reconcile() {
       fi
       state_upsert "$email" "$remote"
       if ! setup_account "$email" "$remote"; then
+        failures=1
+      elif ! setup_shared_drives "$email" "$remote"; then
         failures=1
       fi
     else
@@ -658,6 +919,8 @@ add_account() {
     fi
     state_upsert "$email" "$existing"
     setup_account "$email" "$existing" || exit 1
+    setup_shared_drives "$email" "$existing" ||
+      warn "some shared drives for $email are not mounted"
     bookmark_sync
     printf 'Account %s is already configured; token updated.\n' "$email"
     return 0
@@ -676,6 +939,8 @@ add_account() {
       fi
       state_upsert "$email" "$remote"
       setup_account "$email" "$remote" || exit 1
+      setup_shared_drives "$email" "$remote" ||
+        warn "some shared drives for $email are not mounted"
       bookmark_sync
       printf 'Account %s is already configured; token updated.\n' "$email"
       return 0
@@ -697,6 +962,8 @@ add_account() {
   state_upsert "$email" "$remote"
   printf 'Created rclone remote %s for %s.\n' "$remote" "$email"
   setup_account "$email" "$remote" || exit 1
+  setup_shared_drives "$email" "$remote" ||
+    warn "some shared drives for $email are not mounted"
   bookmark_sync
   printf 'Account %s is ready.\n' "$email"
   return 0
@@ -773,6 +1040,8 @@ reauth() {
   fi
   state_upsert "$resolved" "$remote"
   setup_account "$resolved" "$remote" || exit 1
+  setup_shared_drives "$resolved" "$remote" ||
+    warn "some shared drives for $resolved are not mounted"
   bookmark_sync
   printf 'Account %s is authorized and mounted.\n' "$resolved"
   return 0

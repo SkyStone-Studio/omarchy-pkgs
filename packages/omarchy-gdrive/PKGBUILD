@@ -1,6 +1,6 @@
 # Maintainer: SSS-Marcelo
 pkgname=omarchy-gdrive
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc='Google Drive integration for Omarchy Files via account-named rclone FUSE mounts'
 arch=('any')
@@ -14,10 +14,10 @@ source=('omarchy-gdrive-setup'
         'omarchy-gdrive-setup.desktop'
         'README.md'
         'LICENSE')
-sha256sums=('05d563751aace8fdd7cd5f7870a6be45878eee7a72e4a9024be0b2822994f346'
+sha256sums=('5ce6aa04a01ec465570ac39f9ea35d66e8a3ddebc0a7ff09db8c630b485a45bc'
             '65b4d58450fbc57e3ccb6a40ed20ac0321b8ee923b5fea21f66a12f5f1c73fc6'
             '5cca605113b3aacc7aec55e72deddb368fd0711486cb4a5375964ad1a675210a'
-            '1a677c1332099ee1b2a45e47e1699ac40cf42d5d58d4ebfce89c8fd8858fd402'
+            'a6a98ca60d84ab8b9ef5d08a9b3cce105cb5ce3bc88bda50ea83ebfcc6f8b073'
             'd6646ba1fcc87c4e1d9213fa8e420e67b7188b1f7bd120af54d016f6e18f0e1f')
 
 package() {
