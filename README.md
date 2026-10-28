@@ -1,0 +1,2 @@
+# omarchy-pkgs
+OMARCHY Packages
